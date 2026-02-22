@@ -33,6 +33,12 @@ Optional (recommended for large repositories to avoid GitHub rate limits):
 export GITHUB_TOKEN="your_github_token"
 ```
 
+Windows PowerShell:
+
+```powershell
+$env:GITHUB_TOKEN="your_github_token"
+```
+
 Run server:
 
 ```bash

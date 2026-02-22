@@ -237,6 +237,7 @@ async def fetch_repo_context(github_url: str) -> str:
     headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "github-summarizer-app",
     }
     github_token = os.environ.get("GITHUB_TOKEN")
     if github_token:

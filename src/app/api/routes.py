@@ -1,4 +1,5 @@
 import logging
+from datetime import UTC, datetime
 
 import httpx
 from fastapi import APIRouter, Request, status
@@ -18,6 +19,19 @@ def _error(message: str, status_code: int) -> JSONResponse:
         status_code=status_code,
         content=ErrorResponse(message=message).model_dump(),
     )
+
+
+def _github_rate_limit_message(response: httpx.Response) -> str:
+    reset_raw = response.headers.get("x-ratelimit-reset")
+    if reset_raw and reset_raw.isdigit():
+        reset_dt = datetime.fromtimestamp(int(reset_raw), tz=UTC)
+        reset_text = reset_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        return (
+            "GitHub API rate limit exceeded. "
+            f"Rate limit resets at {reset_text}. "
+            "Set GITHUB_TOKEN to increase limits."
+        )
+    return "GitHub API rate limit exceeded. Please try again later or set GITHUB_TOKEN."
 
 
 @router.post(
@@ -55,7 +69,7 @@ async def summarize(request: Request) -> JSONResponse | SummarizeResponse:
             )
         if exc.response.status_code in (403, 429):
             return _error(
-                "GitHub API rate limit exceeded. Please try again later.",
+                _github_rate_limit_message(exc.response),
                 status.HTTP_429_TOO_MANY_REQUESTS,
             )
         logger.exception("GitHub API error for %s", github_url)
