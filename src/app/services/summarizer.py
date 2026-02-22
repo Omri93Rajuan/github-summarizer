@@ -18,11 +18,11 @@ You are a senior software engineer specializing in quickly understanding unfamil
 Given repository content (directory tree, README, config files, source files), produce a concise structured analysis.
 
 You MUST respond with a single valid JSON object - no markdown fences, no extra text:
-{
+{{
   "summary": "2-4 sentences: what the project does, who it is for, why it is useful",
   "technologies": ["main languages", "frameworks", "libraries", "databases", "tools"],
   "structure": "1-2 sentences describing the directory layout and key components"
-}
+}}
 """
 
 HUMAN_PROMPT = """\
@@ -75,4 +75,3 @@ async def run_summarize_chain(github_url: str, context: str) -> SummarizeRespons
     raw: str = response.content  # type: ignore[assignment]
     logger.debug("Raw LLM response: %s", raw[:500])
     return _parse_response(raw)
-
