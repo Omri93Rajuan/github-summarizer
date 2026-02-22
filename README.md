@@ -27,7 +27,7 @@ Windows PowerShell:
 $env:NEBIUS_API_KEY="your_key"
 ```
 
-Optional (recommended for large repositories to avoid GitHub rate limits):
+Optional (recommended, especially for large repositories, to avoid GitHub rate limits):
 
 ```bash
 export GITHUB_TOKEN="your_github_token"
@@ -38,6 +38,10 @@ Windows PowerShell:
 ```powershell
 $env:GITHUB_TOKEN="your_github_token"
 ```
+
+Summary:
+- `NEBIUS_API_KEY` is required.
+- `GITHUB_TOKEN` is optional but recommended.
 
 Run server:
 
