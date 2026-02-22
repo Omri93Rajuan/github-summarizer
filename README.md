@@ -1,8 +1,8 @@
 # GitHub Repository Summarizer
 
-A FastAPI service that accepts a GitHub repository URL and returns a structured, human-readable summary — what the project does, which technologies it uses, and how it is organized.
+A FastAPI service that accepts a GitHub repository URL and returns a structured, human-readable summary: what the project does, which technologies it uses, and how it is organized.
 
-Built with **Python 3.10+**, **LangChain**, and **Nebius Token Factory** (Llama 3.1 70B).
+Built with **Python 3.10+**, **LangChain**, and **Nebius**.
 
 ---
 
@@ -27,11 +27,18 @@ export NEBIUS_API_KEY="your_nebius_api_key_here"
 ```
 
 Windows (PowerShell):
+
 ```powershell
 $env:NEBIUS_API_KEY="your_nebius_api_key_here"
 ```
 
 ### 3. Start the server
+
+```bash
+uvicorn src.app.main:app --host 0.0.0.0 --port 8000
+```
+
+Backward-compatible entrypoint still works:
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8000
@@ -46,6 +53,7 @@ curl -X POST http://localhost:8000/summarize \
 ```
 
 Expected response:
+
 ```json
 {
   "summary": "Requests is a widely-used Python HTTP library...",
@@ -55,48 +63,54 @@ Expected response:
 ```
 
 Error responses include an HTTP status code and:
+
 ```json
 { "status": "error", "message": "..." }
 ```
 
 ---
 
-## Design Decisions
+## Project Structure
+
+```text
+src/
+  app/
+    main.py
+    api/
+      routes.py
+    services/
+      github_fetcher.py
+      summarizer.py
+    schemas/
+      request.py
+      response.py
+      error.py
+    core/
+      config.py
+      logging.py
+```
+
+---
+
+## Design Notes
 
 ### Model
-**`meta-llama/Meta-Llama-3.1-70B-Instruct`** via Nebius Token Factory.  
-Strong instruction-following and reliable structured JSON output; handles technical/code content well.
 
-### How repository content is handled
+`openai/gpt-oss-120b` via Nebius.
 
-Fetching uses the **GitHub REST API** (no extra tools required). Content is assembled in three steps:
+### Repository content strategy
 
-**1. Filter aggressively (`src/fetcher.py`)**  
-Skip anything that adds noise without insight:
-- Binary files (images, fonts, compiled artifacts)
-- Dependency lock files (`package-lock.json`, `yarn.lock`, `poetry.lock`, etc.) — verbose and redundant with manifest files
-- Generated/build directories (`dist/`, `build/`, `node_modules/`, `__pycache__/`, etc.)
-- IDE/OS metadata (`.DS_Store`, `.gitignore`, etc.)
+1. Filter aggressively (`src/app/services/github_fetcher.py`)
+- Skips binary files, lock files, generated/build directories, and metadata noise.
 
-**2. Prioritize high-signal files**  
-Read in this order until the context budget is used:
-- `README.md` / `README.rst` — the single best summary of any project
-- Manifest files (`package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`) — reveal language, dependencies, and scripts
-- `Dockerfile` / `docker-compose.yml` — expose deployment context and services
-- `requirements.txt`, `Makefile` — additional technical context
+2. Prioritize high-signal files
+- Reads README, manifest files, Docker files, and requirements first.
 
-**3. Stay within context limits**  
-- Hard cap: **60,000 characters** (~15k tokens) total
-- Per-file cap: **8,000 characters** — long files are truncated, not excluded
-- Remaining budget is filled with other source files ordered by directory depth (shallow files first)
-- The filtered directory tree is always included first to give the LLM structural awareness
+3. Keep context bounded
+- Hard cap: `60,000` chars
+- Per-file cap: `8,000` chars
+- Remaining budget is filled with source files ordered by path depth.
 
-### Architecture
+### Request flow
 
-```
-POST /summarize
-    └── FastAPI  (main.py)
-        ├── Input validation          (src/models.py  — Pydantic)
-        ├── Repository fetching       (src/fetcher.py — GitHub REST API + httpx)
-        └── LLM summarization         (src/agent.py   — LangChain + Nebius)
-```
+`POST /summarize` -> FastAPI route -> GitHub fetcher service -> LLM summarizer service -> structured JSON response.
