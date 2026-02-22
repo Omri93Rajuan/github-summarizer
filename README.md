@@ -68,6 +68,12 @@ Error responses include an HTTP status code and:
 { "status": "error", "message": "..." }
 ```
 
+### 5. Run tests
+
+```bash
+pytest -q
+```
+
 ---
 
 ## Project Structure
