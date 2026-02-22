@@ -1,6 +1,4 @@
-"""
-Fetch and filter GitHub repository content via a single archive download.
-"""
+"""Fetch and filter GitHub repository content for LLM summarization."""
 
 import base64
 import io
@@ -82,7 +80,7 @@ SKIP_FILENAMES: frozenset[str] = frozenset(
     }
 )
 
-PRIORITY_FILES: list[str] = [
+PRIORITY_FILES: tuple[str, ...] = (
     "README.md",
     "README.rst",
     "README.txt",
@@ -101,7 +99,7 @@ PRIORITY_FILES: list[str] = [
     "requirements.txt",
     "Makefile",
     ".env.example",
-]
+)
 
 MAX_CONTEXT_CHARS = 60_000
 MAX_FILE_CHARS = 8_000
@@ -183,18 +181,14 @@ def _is_likely_source_file(path: str) -> bool:
 
 
 def _path_rank(path: str) -> tuple[int, int, int]:
-    rank = 1
-    if path.startswith(PRIORITY_DIR_PREFIXES):
-        rank = 0
+    rank = 0 if path.startswith(PRIORITY_DIR_PREFIXES) else 1
     return (rank, path.count("/"), len(path))
 
 
 def _is_rate_limited(response: httpx.Response) -> bool:
-    if response.status_code == 429:
-        return True
-    if response.status_code == 403 and response.headers.get("x-ratelimit-remaining") == "0":
-        return True
-    return False
+    return response.status_code == 429 or (
+        response.status_code == 403 and response.headers.get("x-ratelimit-remaining") == "0"
+    )
 
 
 def _strip_archive_root(path: str) -> str:
@@ -203,71 +197,40 @@ def _strip_archive_root(path: str) -> str:
     return path.split("/", 1)[1]
 
 
+def _select_candidate_paths(paths: list[str]) -> list[str]:
+    return sorted(
+        (path for path in paths if path not in PRIORITY_FILES and _is_likely_source_file(path)),
+        key=_path_rank,
+    )
+
+
+async def _fetch_default_branch(client: httpx.AsyncClient, owner: str, repo: str) -> str:
+    response = await client.get(f"https://api.github.com/repos/{owner}/{repo}")
+    if _is_rate_limited(response):
+        response.raise_for_status()
+    response.raise_for_status()
+    data = response.json()
+    branch = data.get("default_branch")
+    if not branch:
+        raise ValueError("Could not determine repository default branch.")
+    return branch
+
+
 async def _fetch_contents_file(client: httpx.AsyncClient, owner: str, repo: str, path: str) -> str | None:
     response = await client.get(f"https://api.github.com/repos/{owner}/{repo}/contents/{path}")
     if _is_rate_limited(response):
         response.raise_for_status()
     if response.status_code != 200:
         return None
+
     data = response.json()
     if data.get("encoding") != "base64":
         return None
+
     try:
         return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
     except Exception:
         return None
-
-
-async def _fetch_via_tree_fallback(
-    client: httpx.AsyncClient,
-    owner: str,
-    repo: str,
-    ctx: "RepoContext",
-) -> str:
-    tree_resp = await client.get(
-        f"https://api.github.com/repos/{owner}/{repo}/git/trees/HEAD",
-        params={"recursive": "1"},
-    )
-    if _is_rate_limited(tree_resp):
-        tree_resp.raise_for_status()
-    tree_resp.raise_for_status()
-    tree_data = tree_resp.json()
-
-    all_paths = sorted(
-        item["path"]
-        for item in tree_data.get("tree", [])
-        if item.get("type") == "blob" and not _should_skip(item["path"])
-    )
-    ctx.add("DIRECTORY TREE (filtered)", "\n".join(all_paths))
-
-    requests_used = 0
-    all_paths_set = set(all_paths)
-
-    for filename in PRIORITY_FILES:
-        if ctx.total_chars >= MAX_CONTEXT_CHARS or requests_used >= MAX_FALLBACK_FILE_REQUESTS:
-            break
-        if filename not in all_paths_set:
-            continue
-        content = await _fetch_contents_file(client, owner, repo, filename)
-        requests_used += 1
-        if content is None:
-            continue
-        ctx.add(filename, content)
-
-    remaining_files = sorted(
-        (path for path in all_paths if path not in PRIORITY_FILES and _is_likely_source_file(path)),
-        key=_path_rank,
-    )
-    for path in remaining_files:
-        if ctx.total_chars >= MAX_CONTEXT_CHARS or requests_used >= MAX_FALLBACK_FILE_REQUESTS:
-            break
-        content = await _fetch_contents_file(client, owner, repo, path)
-        requests_used += 1
-        if content is None:
-            continue
-        ctx.add(path, content)
-
-    return ctx.render()
 
 
 @dataclass
@@ -290,6 +253,76 @@ class RepoContext:
         return "".join(self.sections)[:MAX_CONTEXT_CHARS]
 
 
+async def _fetch_via_tree_fallback(
+    client: httpx.AsyncClient,
+    owner: str,
+    repo: str,
+    branch: str,
+    ctx: RepoContext,
+) -> str:
+    tree_response = await client.get(
+        f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}",
+        params={"recursive": "1"},
+    )
+    if _is_rate_limited(tree_response):
+        tree_response.raise_for_status()
+    tree_response.raise_for_status()
+
+    tree_data = tree_response.json()
+    all_paths = sorted(
+        item["path"]
+        for item in tree_data.get("tree", [])
+        if item.get("type") == "blob" and not _should_skip(item["path"])
+    )
+    ctx.add("DIRECTORY TREE (filtered)", "\n".join(all_paths))
+
+    requests_used = 0
+    path_set = set(all_paths)
+
+    for filename in PRIORITY_FILES:
+        if ctx.total_chars >= MAX_CONTEXT_CHARS or requests_used >= MAX_FALLBACK_FILE_REQUESTS:
+            break
+        if filename not in path_set:
+            continue
+
+        content = await _fetch_contents_file(client, owner, repo, filename)
+        requests_used += 1
+        if content is not None:
+            ctx.add(filename, content)
+
+    for path in _select_candidate_paths(all_paths):
+        if ctx.total_chars >= MAX_CONTEXT_CHARS or requests_used >= MAX_FALLBACK_FILE_REQUESTS:
+            break
+
+        content = await _fetch_contents_file(client, owner, repo, path)
+        requests_used += 1
+        if content is not None:
+            ctx.add(path, content)
+
+    logger.info("Used tree fallback for %s/%s with %d file requests", owner, repo, requests_used)
+    return ctx.render()
+
+
+def _extract_zip_paths(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
+    path_to_info: dict[str, zipfile.ZipInfo] = {}
+    for info in archive.infolist():
+        if info.is_dir():
+            continue
+        logical_path = _strip_archive_root(info.filename)
+        if not logical_path or _should_skip(logical_path):
+            continue
+        path_to_info[logical_path] = info
+    return path_to_info
+
+
+def _read_zip_file(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> str | None:
+    try:
+        with archive.open(info) as file_handle:
+            return file_handle.read(MAX_FILE_READ_BYTES).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
 async def fetch_repo_context(github_url: str) -> str:
     owner, repo = _parse_owner_repo(github_url)
     ctx = RepoContext(owner=owner, repo=repo)
@@ -304,12 +337,15 @@ async def fetch_repo_context(github_url: str) -> str:
         headers["Authorization"] = f"Bearer {github_token}"
 
     async with httpx.AsyncClient(headers=headers, timeout=25.0, follow_redirects=True) as client:
-        archive_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}/zipball")
-        if _is_rate_limited(archive_resp):
-            archive_resp.raise_for_status()
-        archive_resp.raise_for_status()
+        branch = await _fetch_default_branch(client, owner, repo)
 
-        archive_bytes = archive_resp.content
+        zip_response = await client.get(f"https://api.github.com/repos/{owner}/{repo}/zipball/{branch}")
+        if _is_rate_limited(zip_response):
+            zip_response.raise_for_status()
+        zip_response.raise_for_status()
+
+        archive_bytes = zip_response.content
+
         if len(archive_bytes) > MAX_ARCHIVE_BYTES:
             logger.info(
                 "Archive too large (%d bytes). Switching to tree fallback for %s/%s",
@@ -317,59 +353,42 @@ async def fetch_repo_context(github_url: str) -> str:
                 owner,
                 repo,
             )
-            result = await _fetch_via_tree_fallback(client, owner, repo, ctx)
+            result = await _fetch_via_tree_fallback(client, owner, repo, branch, ctx)
         else:
-            with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
-                path_to_info: dict[str, zipfile.ZipInfo] = {}
-                for info in archive.infolist():
-                    if info.is_dir():
-                        continue
-                    logical_path = _strip_archive_root(info.filename)
-                    if not logical_path or _should_skip(logical_path):
-                        continue
-                    path_to_info[logical_path] = info
+            try:
+                with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+                    path_to_info = _extract_zip_paths(archive)
+                    all_paths = sorted(path_to_info.keys())
+                    ctx.add("DIRECTORY TREE (filtered)", "\n".join(all_paths))
 
-                all_paths = sorted(path_to_info.keys())
-                ctx.add("DIRECTORY TREE (filtered)", "\n".join(all_paths))
+                    files_read = 0
+                    path_set = set(all_paths)
 
-                files_read = 0
-                all_paths_set = set(all_paths)
+                    for filename in PRIORITY_FILES:
+                        if ctx.total_chars >= MAX_CONTEXT_CHARS or files_read >= MAX_FILES_TO_READ:
+                            break
+                        if filename not in path_set:
+                            continue
 
-                for filename in PRIORITY_FILES:
-                    if ctx.total_chars >= MAX_CONTEXT_CHARS or files_read >= MAX_FILES_TO_READ:
-                        break
-                    if filename not in all_paths_set:
-                        continue
-                    info = path_to_info[filename]
-                    try:
-                        with archive.open(info) as file_handle:
-                            content = file_handle.read(MAX_FILE_READ_BYTES).decode("utf-8", errors="replace")
-                    except Exception:
-                        continue
-                    ctx.add(filename, content)
-                    files_read += 1
+                        content = _read_zip_file(archive, path_to_info[filename])
+                        if content is not None:
+                            ctx.add(filename, content)
+                            files_read += 1
 
-                remaining_files = sorted(
-                    (
-                        path
-                        for path in all_paths
-                        if path not in PRIORITY_FILES and _is_likely_source_file(path)
-                    ),
-                    key=_path_rank,
-                )
+                    for path in _select_candidate_paths(all_paths):
+                        if ctx.total_chars >= MAX_CONTEXT_CHARS or files_read >= MAX_FILES_TO_READ:
+                            break
 
-                for path in remaining_files:
-                    if ctx.total_chars >= MAX_CONTEXT_CHARS or files_read >= MAX_FILES_TO_READ:
-                        break
-                    info = path_to_info[path]
-                    try:
-                        with archive.open(info) as file_handle:
-                            content = file_handle.read(MAX_FILE_READ_BYTES).decode("utf-8", errors="replace")
-                    except Exception:
-                        continue
-                    ctx.add(path, content)
-                    files_read += 1
-            result = ctx.render()
+                        content = _read_zip_file(archive, path_to_info[path])
+                        if content is not None:
+                            ctx.add(path, content)
+                            files_read += 1
+
+                    logger.info("Used zip strategy for %s/%s with %d files read", owner, repo, files_read)
+                    result = ctx.render()
+            except zipfile.BadZipFile:
+                logger.warning("Invalid zip archive for %s/%s, switching to tree fallback", owner, repo)
+                result = await _fetch_via_tree_fallback(client, owner, repo, branch, ctx)
 
     if not result.strip():
         raise ValueError("Repository appears to be empty or has no readable files.")

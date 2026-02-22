@@ -40,7 +40,8 @@ def _github_rate_limit_message(response: httpx.Response) -> str:
     responses={
         400: {"model": ErrorResponse},
         404: {"model": ErrorResponse},
-        422: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+        502: {"model": ErrorResponse},
         500: {"model": ErrorResponse},
     },
 )
