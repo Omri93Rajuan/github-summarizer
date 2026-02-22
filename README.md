@@ -87,6 +87,7 @@ It gives stable structured JSON output and good code understanding for this task
 ## Repo processing approach
 
 Since repos can be big, I do this:
+- download the repository archive once (zipball) instead of calling GitHub per file
 - always include filtered directory tree first
 - prioritize high-signal files (README, manifests, Dockerfiles, requirements, Makefile)
 - skip noisy content (binaries, lock files, `node_modules`, `dist`, `build`, caches)

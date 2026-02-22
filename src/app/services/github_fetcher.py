@@ -1,10 +1,11 @@
 """
-Fetch and filter GitHub repository content via the GitHub REST API.
+Fetch and filter GitHub repository content via a single archive download.
 """
 
-import base64
+import io
 import logging
 import os
+import zipfile
 from dataclasses import dataclass, field
 
 import httpx
@@ -103,8 +104,9 @@ PRIORITY_FILES: list[str] = [
 
 MAX_CONTEXT_CHARS = 60_000
 MAX_FILE_CHARS = 8_000
-MAX_FILE_REQUESTS = 40
-MAX_API_CALLS = 60
+MAX_FILES_TO_READ = 80
+MAX_ARCHIVE_BYTES = 40_000_000
+MAX_FILE_READ_BYTES = 200_000
 
 SOURCE_EXTENSIONS: frozenset[str] = frozenset(
     {
@@ -193,21 +195,10 @@ def _is_rate_limited(response: httpx.Response) -> bool:
     return False
 
 
-async def _fetch_file_content(client: httpx.AsyncClient, url: str) -> tuple[str | None, bool]:
-    response = await client.get(url)
-    if _is_rate_limited(response):
-        return None, True
-    if response.status_code != 200:
-        return None, False
-
-    data = response.json()
-    if data.get("encoding") != "base64":
-        return None, False
-    try:
-        content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
-    except Exception:
-        return None, False
-    return content, False
+def _strip_archive_root(path: str) -> str:
+    if "/" not in path:
+        return path
+    return path.split("/", 1)[1]
 
 
 @dataclass
@@ -235,7 +226,7 @@ async def fetch_repo_context(github_url: str) -> str:
     ctx = RepoContext(owner=owner, repo=repo)
 
     headers = {
-        "Accept": "application/vnd.github+json",
+        "Accept": "application/vnd.github+json, application/zip",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "github-summarizer-app",
     }
@@ -243,93 +234,76 @@ async def fetch_repo_context(github_url: str) -> str:
     if github_token:
         headers["Authorization"] = f"Bearer {github_token}"
 
-    async with httpx.AsyncClient(headers=headers, timeout=15.0) as client:
-        api_calls = 0
-        file_requests = 0
+    async with httpx.AsyncClient(headers=headers, timeout=25.0, follow_redirects=True) as client:
+        archive_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}/zipball")
+        if _is_rate_limited(archive_resp):
+            archive_resp.raise_for_status()
+        archive_resp.raise_for_status()
 
-        tree_resp = await client.get(
-            f"https://api.github.com/repos/{owner}/{repo}/git/trees/HEAD",
-            params={"recursive": "1"},
-        )
-        api_calls += 1
-        tree_resp.raise_for_status()
-        tree_data = tree_resp.json()
+        archive_bytes = archive_resp.content
+        if len(archive_bytes) > MAX_ARCHIVE_BYTES:
+            raise ValueError("Repository archive is too large to summarize with current limits.")
 
-        all_paths: list[str] = [
-            item["path"] for item in tree_data.get("tree", []) if item["type"] == "blob"
-        ]
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            path_to_info: dict[str, zipfile.ZipInfo] = {}
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                logical_path = _strip_archive_root(info.filename)
+                if not logical_path or _should_skip(logical_path):
+                    continue
+                path_to_info[logical_path] = info
 
-        readable_tree = "\n".join(path for path in all_paths if not _should_skip(path))
-        ctx.add("DIRECTORY TREE (filtered)", readable_tree)
+            all_paths = sorted(path_to_info.keys())
+            ctx.add("DIRECTORY TREE (filtered)", "\n".join(all_paths))
 
-        rate_limited = False
+            files_read = 0
+            all_paths_set = set(all_paths)
 
-        for filename in PRIORITY_FILES:
-            if ctx.total_chars >= MAX_CONTEXT_CHARS or file_requests >= MAX_FILE_REQUESTS or api_calls >= MAX_API_CALLS:
-                break
-            if filename not in all_paths:
-                continue
+            for filename in PRIORITY_FILES:
+                if ctx.total_chars >= MAX_CONTEXT_CHARS or files_read >= MAX_FILES_TO_READ:
+                    break
+                if filename not in all_paths_set:
+                    continue
+                info = path_to_info[filename]
+                try:
+                    with archive.open(info) as file_handle:
+                        content = file_handle.read(MAX_FILE_READ_BYTES).decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                ctx.add(filename, content)
+                files_read += 1
 
-            content, limited = await _fetch_file_content(
-                client,
-                f"https://api.github.com/repos/{owner}/{repo}/contents/{filename}",
+            remaining_files = sorted(
+                (
+                    path
+                    for path in all_paths
+                    if path not in PRIORITY_FILES and _is_likely_source_file(path)
+                ),
+                key=_path_rank,
             )
-            api_calls += 1
-            file_requests += 1
-            if limited:
-                rate_limited = True
-                logger.warning("GitHub rate limit hit while fetching priority file: %s", filename)
-                break
-            if content is None:
-                continue
-            ctx.add(filename, content)
 
-        remaining_files = sorted(
-            (
-                path
-                for path in all_paths
-                if not _should_skip(path)
-                and path not in PRIORITY_FILES
-                and _is_likely_source_file(path)
-            ),
-            key=_path_rank,
-        )
-
-        for path in remaining_files:
-            if rate_limited:
-                break
-            if (
-                ctx.total_chars >= MAX_CONTEXT_CHARS
-                or file_requests >= MAX_FILE_REQUESTS
-                or api_calls >= MAX_API_CALLS
-            ):
-                break
-
-            content, limited = await _fetch_file_content(
-                client,
-                f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
-            )
-            api_calls += 1
-            file_requests += 1
-            if limited:
-                rate_limited = True
-                logger.warning("GitHub rate limit hit while fetching file: %s", path)
-                break
-            if content is None:
-                continue
-            ctx.add(path, content)
+            for path in remaining_files:
+                if ctx.total_chars >= MAX_CONTEXT_CHARS or files_read >= MAX_FILES_TO_READ:
+                    break
+                info = path_to_info[path]
+                try:
+                    with archive.open(info) as file_handle:
+                        content = file_handle.read(MAX_FILE_READ_BYTES).decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                ctx.add(path, content)
+                files_read += 1
 
     result = ctx.render()
     if not result.strip():
         raise ValueError("Repository appears to be empty or has no readable files.")
 
     logger.info(
-        "Gathered repo context for %s/%s: %d chars across %d sections (api_calls=%d file_requests=%d)",
+        "Gathered repo context for %s/%s: %d chars across %d sections",
         owner,
         repo,
         len(result),
         len(ctx.sections),
-        api_calls,
-        file_requests,
     )
     return result
