@@ -53,7 +53,7 @@ async def summarize(request: Request) -> JSONResponse | SummarizeResponse:
                 f"Repository not found: '{github_url}'. Make sure it is public and the URL is correct.",
                 status.HTTP_404_NOT_FOUND,
             )
-        if exc.response.status_code == 403:
+        if exc.response.status_code in (403, 429):
             return _error(
                 "GitHub API rate limit exceeded. Please try again later.",
                 status.HTTP_429_TOO_MANY_REQUESTS,
@@ -80,4 +80,3 @@ async def summarize(request: Request) -> JSONResponse | SummarizeResponse:
 
     logger.info("Successfully summarized %s", github_url)
     return result
-
