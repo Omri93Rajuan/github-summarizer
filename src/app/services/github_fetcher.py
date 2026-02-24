@@ -103,6 +103,8 @@ PRIORITY_FILES: tuple[str, ...] = (
 
 MAX_CONTEXT_CHARS = 60_000
 MAX_FILE_CHARS = 8_000
+MAX_CONTEXT_TOKENS = 15_000
+MAX_FILE_TOKENS = 2_000
 MAX_FILES_TO_READ = 80
 MAX_ARCHIVE_BYTES = 40_000_000
 MAX_FILE_READ_BYTES = 200_000
@@ -191,6 +193,23 @@ def _is_rate_limited(response: httpx.Response) -> bool:
     )
 
 
+def _approx_token_count(text: str) -> int:
+    # Rough approximation for budget control to avoid large context windows.
+    return max(1, len(text) // 4)
+
+
+def _is_probably_binary(data: bytes) -> bool:
+    if not data:
+        return False
+
+    sample = data[:4096]
+    if b"\x00" in sample:
+        return True
+
+    control_bytes = sum(1 for byte in sample if byte < 9 or (13 < byte < 32))
+    return (control_bytes / len(sample)) > 0.3
+
+
 def _strip_archive_root(path: str) -> str:
     if "/" not in path:
         return path
@@ -228,7 +247,10 @@ async def _fetch_contents_file(client: httpx.AsyncClient, owner: str, repo: str,
         return None
 
     try:
-        return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+        raw = base64.b64decode(data["content"])
+        if _is_probably_binary(raw):
+            return None
+        return raw.decode("utf-8", errors="replace")
     except Exception:
         return None
 
@@ -239,15 +261,35 @@ class RepoContext:
     repo: str
     sections: list[str] = field(default_factory=list)
     total_chars: int = 0
+    total_tokens: int = 0
 
     def add(self, header: str, content: str) -> bool:
-        if self.total_chars >= MAX_CONTEXT_CHARS:
+        if self.is_full():
             return False
-        body = content[:MAX_FILE_CHARS]
-        entry = f"=== {header} ===\n{body}\n\n"
+
+        prefix = f"=== {header} ===\n"
+        suffix = "\n\n"
+        wrapper_chars = len(prefix) + len(suffix)
+        wrapper_tokens = _approx_token_count(prefix + suffix)
+
+        remaining_chars = MAX_CONTEXT_CHARS - self.total_chars - wrapper_chars
+        remaining_tokens = MAX_CONTEXT_TOKENS - self.total_tokens - wrapper_tokens
+        if remaining_chars <= 0 or remaining_tokens <= 0:
+            return False
+
+        body_char_limit = min(MAX_FILE_CHARS, remaining_chars, MAX_FILE_TOKENS * 4, remaining_tokens * 4)
+        if body_char_limit <= 0:
+            return False
+
+        body = content[:body_char_limit]
+        entry = f"{prefix}{body}{suffix}"
         self.sections.append(entry)
         self.total_chars += len(entry)
+        self.total_tokens += _approx_token_count(entry)
         return True
+
+    def is_full(self) -> bool:
+        return self.total_chars >= MAX_CONTEXT_CHARS or self.total_tokens >= MAX_CONTEXT_TOKENS
 
     def render(self) -> str:
         return "".join(self.sections)[:MAX_CONTEXT_CHARS]
@@ -280,7 +322,7 @@ async def _fetch_via_tree_fallback(
     path_set = set(all_paths)
 
     for filename in PRIORITY_FILES:
-        if ctx.total_chars >= MAX_CONTEXT_CHARS or requests_used >= MAX_FALLBACK_FILE_REQUESTS:
+        if ctx.is_full() or requests_used >= MAX_FALLBACK_FILE_REQUESTS:
             break
         if filename not in path_set:
             continue
@@ -291,7 +333,7 @@ async def _fetch_via_tree_fallback(
             ctx.add(filename, content)
 
     for path in _select_candidate_paths(all_paths):
-        if ctx.total_chars >= MAX_CONTEXT_CHARS or requests_used >= MAX_FALLBACK_FILE_REQUESTS:
+        if ctx.is_full() or requests_used >= MAX_FALLBACK_FILE_REQUESTS:
             break
 
         content = await _fetch_contents_file(client, owner, repo, path)
@@ -318,7 +360,10 @@ def _extract_zip_paths(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
 def _read_zip_file(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> str | None:
     try:
         with archive.open(info) as file_handle:
-            return file_handle.read(MAX_FILE_READ_BYTES).decode("utf-8", errors="replace")
+            raw = file_handle.read(MAX_FILE_READ_BYTES)
+            if _is_probably_binary(raw):
+                return None
+            return raw.decode("utf-8", errors="replace")
     except Exception:
         return None
 
@@ -365,7 +410,7 @@ async def fetch_repo_context(github_url: str) -> str:
                     path_set = set(all_paths)
 
                     for filename in PRIORITY_FILES:
-                        if ctx.total_chars >= MAX_CONTEXT_CHARS or files_read >= MAX_FILES_TO_READ:
+                        if ctx.is_full() or files_read >= MAX_FILES_TO_READ:
                             break
                         if filename not in path_set:
                             continue
@@ -376,7 +421,7 @@ async def fetch_repo_context(github_url: str) -> str:
                             files_read += 1
 
                     for path in _select_candidate_paths(all_paths):
-                        if ctx.total_chars >= MAX_CONTEXT_CHARS or files_read >= MAX_FILES_TO_READ:
+                        if ctx.is_full() or files_read >= MAX_FILES_TO_READ:
                             break
 
                         content = _read_zip_file(archive, path_to_info[path])

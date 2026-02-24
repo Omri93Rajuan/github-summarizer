@@ -42,6 +42,43 @@ def _build_llm() -> ChatOpenAI:
     )
 
 
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for index in range(start, len(text)):
+        char = text[index]
+
+        if escaped:
+            escaped = False
+            continue
+
+        if char == "\\" and in_string:
+            escaped = True
+            continue
+
+        if char == '"':
+            in_string = not in_string
+            continue
+
+        if in_string:
+            continue
+
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+
+    return None
+
+
 def _parse_response(raw: str) -> SummarizeResponse:
     text = raw.strip()
 
@@ -52,10 +89,13 @@ def _parse_response(raw: str) -> SummarizeResponse:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        obj = re.search(r"\{.*\}", text, re.DOTALL)
-        if not obj:
+        obj = _extract_first_json_object(text)
+        if obj is None:
             raise ValueError(f"LLM returned non-JSON response: {text[:200]}")
-        data = json.loads(obj.group())
+        try:
+            data = json.loads(obj)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"LLM returned invalid JSON: {text[:200]}") from exc
 
     return SummarizeResponse(**data)
 
